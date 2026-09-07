@@ -1,0 +1,16 @@
+# Optional local run of the bridge only. The VS Code extension still runs on
+# the host and talks to http://127.0.0.1:8765.
+services:
+  bridge:
+    build:
+      context: ./bridge
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8765"
+      MAILBOX_DIR: /data/mailbox
+      ASSISTANT_WEBHOOK_URL: ${ASSISTANT_WEBHOOK_URL:-}
+      WEBHOOK_TIMEOUT_SECONDS: "5"
+    volumes:
+      - ./mailbox:/data/mailbox

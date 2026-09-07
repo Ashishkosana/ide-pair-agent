@@ -1,0 +1,5 @@
+{
+  "context_id": "replace-with-id-from-post-context",
+  "text": "The greet helper looks fine. Consider a docstring and a None-guard if callers can pass optional names.",
+  "source": "desktop-assistant"
+}

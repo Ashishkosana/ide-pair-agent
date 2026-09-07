@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "intent": "share_file_diagnostics",
+  "prompt": null,
+  "workspace": {
+    "folder": "/tmp/demo-project",
+    "git_branch": "main"
+  },
+  "file": {
+    "path": "src/app.py",
+    "language_id": "python",
+    "content": "def greet(name):\n    return f\"hello {name}\"\n",
+    "selection": null
+  },
+  "diagnostics": [
+    {
+      "severity": "warning",
+      "message": "Missing return type annotation",
+      "source": "pyright",
+      "start_line": 1,
+      "end_line": 1
+    }
+  ],
+  "client": {
+    "name": "ide-pair-agent-extension",
+    "version": "0.1.0"
+  }
+}
