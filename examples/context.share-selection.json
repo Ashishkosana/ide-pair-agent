@@ -1,0 +1,24 @@
+{
+  "schema_version": "1",
+  "intent": "share_selection",
+  "prompt": null,
+  "workspace": {
+    "folder": "/tmp/demo-project",
+    "git_branch": "main"
+  },
+  "file": {
+    "path": "src/app.py",
+    "language_id": "python",
+    "content": null,
+    "selection": {
+      "text": "def greet(name: str) -> str:\n    return f\"hello {name}\"\n",
+      "start_line": 1,
+      "end_line": 3
+    }
+  },
+  "diagnostics": [],
+  "client": {
+    "name": "ide-pair-agent-extension",
+    "version": "0.1.0"
+  }
+}
