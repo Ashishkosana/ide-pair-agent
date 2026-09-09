@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from pair_bridge import __version__
 from pair_bridge.agent.policy import PolicyDecision, resolve_decision
+from pair_bridge.agent.summarize import summarize_payload
 from pair_bridge.config import Settings
 from pair_bridge.models import (
     AssistantReply,
@@ -103,9 +104,10 @@ def create_app(
         title="IDE Pair Agent Bridge",
         version=__version__,
         description=(
-            "Local M1 bridge: persist IDE context, redact obvious secrets, "
-            "drop JSONL for an assistant, optionally POST a user-configured "
-            "webhook, and accept replies back. Not a finished LLM."
+            "Local pair-agent bridge: persist IDE context, redact obvious "
+            "secrets, apply a deterministic allow/drop/summarize policy, "
+            "write JSONL and/or a user-configured webhook, and accept "
+            "replies back. Not an LLM and not a Cursor/Grok product."
         ),
     )
     app.state.runtime = runtime
@@ -125,6 +127,9 @@ def create_app(
         decision = resolve_decision(
             redacted, webhook_configured=runtime.settings.webhook_configured
         )
+        outbound = redacted
+        if decision.forward and decision.summarize:
+            outbound = summarize_payload(redacted)
         context_id = str(uuid.uuid4())
         policy = PolicyInfo(
             mode=decision.mode,
@@ -136,7 +141,7 @@ def create_app(
         event = StoredEvent(
             context_id=context_id,
             created_at=utcnow(),
-            payload=redacted,
+            payload=outbound,
             policy=policy,
             redaction_hits=hits,
             truncated=truncated,
@@ -156,7 +161,7 @@ def create_app(
             )
             envelope = _envelope(
                 context_id=context_id,
-                payload=redacted,
+                payload=outbound,
                 policy=decision,
                 reply_to=reply_to,
             )

@@ -1,0 +1,32 @@
+{
+  "schema_version": "1",
+  "intent": "ask",
+  "prompt": "Why is greet missing a return type?",
+  "workspace": {
+    "folder": "/tmp/demo-project",
+    "git_branch": "main"
+  },
+  "file": {
+    "path": "src/app.py",
+    "language_id": "python",
+    "content": null,
+    "selection": {
+      "text": "def greet(name):\n    return f\"hello {name}\"\n",
+      "start_line": 1,
+      "end_line": 2
+    }
+  },
+  "diagnostics": [
+    {
+      "severity": "warning",
+      "message": "Missing return type annotation",
+      "source": "pyright",
+      "start_line": 1,
+      "end_line": 1
+    }
+  ],
+  "client": {
+    "name": "ide-pair-agent-extension",
+    "version": "0.1.0"
+  }
+}

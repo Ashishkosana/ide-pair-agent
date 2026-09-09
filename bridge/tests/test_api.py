@@ -28,7 +28,8 @@ def test_post_context_persists_and_mailbox(
     assert response.status_code == 200
     body = response.json()
     assert body["accepted"] is True
-    assert body["policy"]["mode"] == "m1-default"
+    assert body["policy"]["mode"] == "allow"
+    assert body["policy"]["forward"] is True
     assert "mailbox" in body["channels"]
     assert body["mailbox_path"]
     assert store.get_event(body["context_id"]) is not None
@@ -67,10 +68,14 @@ def test_webhook_called_when_configured(mailbox_dir: Path, make_context) -> None
         webhook=adapter,
     )
     client = TestClient(app)
-    response = client.post("/v1/context", json=make_context())
+    response = client.post(
+        "/v1/context",
+        json=make_context(intent="ask", prompt="Why is this unused?"),
+    )
     assert response.status_code == 200
     assert response.json()["webhook"]["attempted"] is True
     assert response.json()["webhook"]["ok"] is True
+    assert response.json()["channels"] == ["mailbox", "webhook"]
     assert seen, "webhook adapter should have POSTed"
     assert seen[0].headers.get("x-pair-agent-event") == "ide.context"
     http.close()
@@ -134,7 +139,10 @@ def test_webhook_failure_does_not_fail_request(mailbox_dir: Path, make_context) 
         mailbox=MailboxWriter(mailbox_dir),
         webhook=WebhookAdapter("https://assistant.example/hook", client=http),
     )
-    response = TestClient(app).post("/v1/context", json=make_context())
+    response = TestClient(app).post(
+        "/v1/context",
+        json=make_context(intent="ask", prompt="Why is this unused?"),
+    )
     assert response.status_code == 200
     assert response.json()["accepted"] is True
     assert response.json()["webhook"]["ok"] is False
@@ -146,3 +154,103 @@ def test_ask_intent_accepted(client: TestClient, make_context) -> None:
     response = client.post("/v1/context", json=body)
     assert response.status_code == 200
     assert response.json()["accepted"] is True
+    assert response.json()["policy"]["mode"] == "allow"
+
+
+def test_quiet_share_does_not_wake_webhook(mailbox_dir: Path, make_context) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(204)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    settings = Settings(
+        mailbox_dir=str(mailbox_dir),
+        assistant_webhook_url="https://assistant.example/hook",
+    )
+    app = create_app(
+        settings=settings,
+        store=EventStore(),
+        mailbox=MailboxWriter(mailbox_dir),
+        webhook=WebhookAdapter("https://assistant.example/hook", client=http),
+    )
+    response = TestClient(app).post("/v1/context", json=make_context())
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert response.json()["channels"] == ["mailbox"]
+    assert response.json()["webhook"]["skipped"] is True
+    assert not seen
+    http.close()
+
+
+def test_lockfile_dropped_skips_mailbox(
+    client: TestClient, mailbox_dir: Path, make_context
+) -> None:
+    body = make_context(
+        intent="share_file_diagnostics",
+        file={
+            "path": "package-lock.json",
+            "language_id": "json",
+            "content": '{"lockfileVersion": 3}\n',
+            "selection": None,
+        },
+    )
+    response = client.post("/v1/context", json=body)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is False
+    assert payload["policy"]["mode"] == "drop"
+    assert payload["channels"] == []
+    assert payload["mailbox_path"] is None
+    assert not (mailbox_dir / "events.jsonl").exists()
+
+
+def test_large_file_summarized_in_mailbox(
+    client: TestClient, mailbox_dir: Path, store: EventStore, make_context
+) -> None:
+    content = "def greet(name):\n    return name\n" + ("x = 1\n" * 2500)
+    body = make_context(
+        intent="share_file_diagnostics",
+        file={
+            "path": "src/app.py",
+            "language_id": "python",
+            "content": content,
+            "selection": None,
+        },
+    )
+    response = client.post("/v1/context", json=body)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["policy"]["mode"] == "summarize"
+    assert payload["policy"]["summarize"] is True
+
+    mailbox = (mailbox_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert "[summarized" in mailbox
+    assert "def greet(name):" in mailbox
+    assert mailbox.count("x = 1") < 5
+    event = store.get_event(payload["context_id"])
+    assert event is not None
+    assert event.payload.file.content is not None
+    assert "[summarized" in event.payload.file.content
+
+
+def test_secrets_only_payload_dropped(client: TestClient, mailbox_dir: Path, make_context) -> None:
+    body = make_context(
+        prompt=None,
+        diagnostics=[],
+        file={
+            "path": ".env",
+            "language_id": "dotenv",
+            "content": "API_KEY=supersecretvalueNOW\nTOKEN=anothersecretvalueX\n",
+            "selection": None,
+        },
+    )
+    response = client.post("/v1/context", json=body)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is False
+    assert payload["policy"]["mode"] == "drop"
+    assert payload["redacted"] is True
+    assert not (mailbox_dir / "events.jsonl").exists()

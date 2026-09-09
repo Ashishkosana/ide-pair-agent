@@ -1,1 +1,1 @@
-"""Agent decision layer. Policy is a stub — not a finished LLM brain."""
+"""Agent decision layer: deterministic allow/drop/summarize policy. Not an LLM."""
