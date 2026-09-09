@@ -1,45 +1,76 @@
-"""Routing / allow / summarize policy.
+"""Routing / allow / summarize / channel policy.
 
-This module is the portfolio hook. M1 ships a conservative default and an
-intentional NotImplementedError. It does **not** generate coding answers.
+Deterministic rules over intent, diagnostics, and selection. This process
+never generates the assistant's coding answer — it only decides whether to
+forward redacted context, whether to replace oversized text with a
+signature excerpt, and which outbound channel to use.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
+from pair_bridge.agent.summarize import (
+    SUMMARIZE_CONTENT_CHARS,
+    SUMMARIZE_SELECTION_CHARS,
+)
 from pair_bridge.models import IdeContextIn
+from pair_bridge.redact import REDACTED
 
-YOU_IMPLEMENT_STEPS = """
-YOU IMPLEMENT: pair_bridge.agent.policy.decide
+# After redaction, leftover alphanumeric budget that still counts as "useful".
+_SECRETS_ONLY_USEFUL_CHARS = 40
+_BINARY_NONTEXT_RATIO = 0.30
+_BINARY_SAMPLE_CHARS = 8_192
 
-This function is intentionally unfinished. Do not replace it with a
-hard-coded fake LLM answer or a canned "I am an AI pair programmer" string.
+LOCKFILE_NAMES = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pnpm-lock.yml",
+        "bun.lock",
+        "bun.lockb",
+        "Cargo.lock",
+        "poetry.lock",
+        "Pipfile.lock",
+        "uv.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "flake.lock",
+    }
+)
 
-Implement these steps:
+BINARY_EXTENSIONS = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+        ".bin",
+        ".wasm",
+        ".class",
+        ".o",
+        ".pyc",
+    }
+)
 
-1. Allow / drop
-   - Drop if the payload is secrets-only, a lockfile dump, or binary-ish.
-   - Allow normal pair-programming context (source + diagnostics + question).
-
-2. Summarize vs raw
-   - If selection/file exceeds a token/char budget, summarize.
-   - You own the summarizer (a model you control, or signature extraction).
-   - M1 must not invent a summary. Until you implement this, send raw
-     (after redaction) or drop.
-
-3. Channel selection
-   - mailbox: local JSONL audit log for an assistant to tail.
-   - webhook: wake a user-configured desktop assistant / automation.
-   - Choose one or both. Do not embed vendor-specific Bot APIs here.
-
-4. Never generate the assistant's coding answer in this process.
-   The bridge forwards context and later accepts a reply. It is not the brain.
-
-Until this is implemented, resolve_decision() catches NotImplementedError
-and uses default_m1_decision(): redact (elsewhere) + forward to mailbox,
-and webhook if ASSISTANT_WEBHOOK_URL is set.
-"""
+_VENDOR_SEGMENTS = frozenset({"node_modules", ".git"})
 
 
 @dataclass(frozen=True)
@@ -51,18 +82,207 @@ class PolicyDecision:
     mode: str
 
 
-def decide(payload: IdeContextIn) -> PolicyDecision:
+def _basename(path: str | None) -> str:
+    if not path:
+        return ""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _text_blob(payload: IdeContextIn) -> str:
+    parts: list[str] = []
+    if payload.prompt:
+        parts.append(payload.prompt)
+    if payload.file.content:
+        parts.append(payload.file.content)
+    if payload.file.selection and payload.file.selection.text:
+        parts.append(payload.file.selection.text)
+    for diagnostic in payload.diagnostics:
+        parts.append(diagnostic.message)
+    return "\n".join(parts)
+
+
+def _looks_binary(text: str) -> bool:
+    if not text:
+        return False
+    if "\x00" in text:
+        return True
+    sample = text[:_BINARY_SAMPLE_CHARS]
+    weird = 0
+    for char in sample:
+        code = ord(char)
+        if code < 32 and char not in "\t\n\r":
+            weird += 1
+        elif code == 127:
+            weird += 1
+    return (weird / len(sample)) >= _BINARY_NONTEXT_RATIO
+
+
+def _is_binary_ish(payload: IdeContextIn) -> bool:
+    ext = Path(payload.file.path or "").suffix.lower()
+    texts: list[str] = []
+    if payload.file.content:
+        texts.append(payload.file.content)
+    if payload.file.selection and payload.file.selection.text:
+        texts.append(payload.file.selection.text)
+    if ext in BINARY_EXTENSIONS and (payload.file.content or not texts):
+        return True
+    return any(_looks_binary(text) for text in texts)
+
+
+def _is_lockfile(payload: IdeContextIn) -> bool:
+    return _basename(payload.file.path) in LOCKFILE_NAMES
+
+
+def _is_vendor_dump(payload: IdeContextIn) -> bool:
+    path = (payload.file.path or "").replace("\\", "/")
+    return any(part in _VENDOR_SEGMENTS for part in path.split("/") if part)
+
+
+def _is_secrets_only(payload: IdeContextIn) -> bool:
+    blob = _text_blob(payload)
+    if REDACTED not in blob:
+        return False
+    leftover = blob.replace(REDACTED, "")
+    useful = re.sub(r"[\W_]+", "", leftover, flags=re.ASCII)
+    return blob.count(REDACTED) >= 1 and len(useful) < _SECRETS_ONLY_USEFUL_CHARS
+
+
+def _has_pair_context(payload: IdeContextIn) -> bool:
+    selection = ""
+    if payload.file.selection and payload.file.selection.text:
+        selection = payload.file.selection.text.strip()
+    content = (payload.file.content or "").strip()
+    prompt = (payload.prompt or "").strip()
+    if payload.intent == "ask":
+        return bool(prompt or selection or content or payload.diagnostics)
+    if payload.intent == "share_selection":
+        return bool(selection)
+    return bool(content or payload.diagnostics)
+
+
+def _over_budget(payload: IdeContextIn) -> bool:
+    content = payload.file.content or ""
+    selection = ""
+    if payload.file.selection and payload.file.selection.text:
+        selection = payload.file.selection.text
+    return (
+        len(content) > SUMMARIZE_CONTENT_CHARS
+        or len(selection) > SUMMARIZE_SELECTION_CHARS
+    )
+
+
+def _should_wake(payload: IdeContextIn) -> bool:
+    """Webhook is a wake-up; mailbox is the audit log."""
+    if payload.intent == "ask":
+        return True
+    if any(item.severity == "error" for item in payload.diagnostics):
+        return True
+    if payload.intent == "share_file_diagnostics" and payload.diagnostics:
+        return True
+    return False
+
+
+def _channels(*, forward: bool, wake: bool, webhook_configured: bool) -> tuple[str, ...]:
+    if not forward:
+        return ()
+    chosen: list[str] = ["mailbox"]
+    if webhook_configured and wake:
+        chosen.append("webhook")
+    return tuple(chosen)
+
+
+def decide(
+    payload: IdeContextIn, *, webhook_configured: bool = False
+) -> PolicyDecision:
     """Decide whether to forward, summarize, and which outbound channel to use.
 
-    Raises:
-        NotImplementedError: intentional M1 marker. See YOU_IMPLEMENT_STEPS.
+    Rules (first match wins for drops):
+
+    1. Drop binary-ish payloads, lockfiles, vendor/VCS dumps, secrets-only
+       leftovers, or empty pair context.
+    2. Summarize when file content or selection exceeds the char budget.
+    3. Channels: mailbox on every forward; webhook only when configured and
+       the event is wake-worthy (ask, errors, or file+diagnostics).
     """
-    del payload  # unused until you implement this
-    raise NotImplementedError(YOU_IMPLEMENT_STEPS)
+    if _is_binary_ish(payload):
+        return PolicyDecision(
+            forward=False,
+            summarize=False,
+            channels=(),
+            reason=(
+                "drop: binary-ish payload (null bytes, high control-char "
+                "ratio, or binary extension)"
+            ),
+            mode="drop",
+        )
+    if _is_lockfile(payload):
+        name = _basename(payload.file.path)
+        return PolicyDecision(
+            forward=False,
+            summarize=False,
+            channels=(),
+            reason=f"drop: lockfile dump ({name})",
+            mode="drop",
+        )
+    if _is_vendor_dump(payload):
+        return PolicyDecision(
+            forward=False,
+            summarize=False,
+            channels=(),
+            reason="drop: vendor or VCS dump (node_modules / .git)",
+            mode="drop",
+        )
+    if _is_secrets_only(payload):
+        return PolicyDecision(
+            forward=False,
+            summarize=False,
+            channels=(),
+            reason=(
+                "drop: secrets-only after redaction; no remaining "
+                "pair-programming context"
+            ),
+            mode="drop",
+        )
+    if not _has_pair_context(payload):
+        return PolicyDecision(
+            forward=False,
+            summarize=False,
+            channels=(),
+            reason="drop: no selection, file, prompt, or diagnostics to pair on",
+            mode="drop",
+        )
+
+    summarize = _over_budget(payload)
+    channels = _channels(
+        forward=True,
+        wake=_should_wake(payload),
+        webhook_configured=webhook_configured,
+    )
+    if summarize:
+        return PolicyDecision(
+            forward=True,
+            summarize=True,
+            channels=channels,
+            reason=(
+                "summarize: selection or file exceeds char budget; "
+                "forward signature extraction (not a generated answer)"
+            ),
+            mode="summarize",
+        )
+    return PolicyDecision(
+        forward=True,
+        summarize=False,
+        channels=channels,
+        reason=(
+            f"allow: {payload.intent} with source and/or diagnostics "
+            "(raw after redaction)"
+        ),
+        mode="allow",
+    )
 
 
 def default_m1_decision(*, webhook_configured: bool) -> PolicyDecision:
-    """Conservative default used while decide() is unimplemented."""
+    """Conservative fallback if decide() is unavailable."""
     channels: list[str] = ["mailbox"]
     if webhook_configured:
         channels.append("webhook")
@@ -81,8 +301,8 @@ def default_m1_decision(*, webhook_configured: bool) -> PolicyDecision:
 def resolve_decision(
     payload: IdeContextIn, *, webhook_configured: bool
 ) -> PolicyDecision:
-    """Call decide(); fall back to the M1 default when it is not implemented."""
+    """Call decide(); fall back only if it still raises NotImplementedError."""
     try:
-        return decide(payload)
+        return decide(payload, webhook_configured=webhook_configured)
     except NotImplementedError:
         return default_m1_decision(webhook_configured=webhook_configured)

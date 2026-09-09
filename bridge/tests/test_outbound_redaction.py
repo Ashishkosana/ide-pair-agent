@@ -14,9 +14,13 @@ def test_secrets_redacted_in_mailbox(
             "language_id": "python",
             "content": None,
             "selection": {
-                "text": "TOKEN = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n",
+                "text": (
+                    "TOKEN = 'sk-abcdefghijklmnopqrstuvwxyz123456'\n"
+                    "def greet(name: str) -> str:\n"
+                    "    return f'hello {name}'\n"
+                ),
                 "start_line": 1,
-                "end_line": 1,
+                "end_line": 3,
             },
         },
     )
